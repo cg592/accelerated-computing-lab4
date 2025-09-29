@@ -7,6 +7,7 @@
 #include <random>
 #include <utility>
 #include <vector>
+#include <cassert>
 
 void cuda_check(cudaError_t code, const char *file, int line) {
     if (code != cudaSuccess) {
@@ -55,8 +56,81 @@ __global__ void matmul_l1(
     int32_t size_k,
     float const *a,
     float const *b,
-    float *c) {
-    /* TODO: your GPU code here */
+    float *c,
+    int TILE_DIM_I,
+    int TILE_DIM_J,
+    int TILE_DIM_K) {
+    
+    int BLOCK_DIM_J = blockDim.x;
+    int BLOCK_DIM_I = blockDim.y;
+    int BLOCK_START_J = blockIdx.x * BLOCK_DIM_J;
+    int BLOCK_START_I = blockIdx.y * BLOCK_DIM_I;
+    int THREADS_PER_WARP = 32;
+    int THREAD_OFFSET_J = threadIdx.x;
+    int THREAD_OFFSET_I = threadIdx.y;
+
+    extern __shared__ float shmem[];
+    float* shared_A = shmem;
+    float* shared_B = shared_A + TILE_DIM_I * TILE_DIM_K;
+    float* shared_C = shared_B + TILE_DIM_K * TILE_DIM_J;
+
+    for (int BLOCK_START_K = 0; BLOCK_START_K < size_k; BLOCK_START_K += TILE_DIM_K) {
+        // LOAD 
+        assert(TILE_DIM_I == THREADS_PER_WARP && TILE_DIM_J == THREADS_PER_WARP && TILE_DIM_K == THREADS_PER_WARP);
+        int thread_load_a_start_i = BLOCK_START_I + THREAD_OFFSET_I;
+        int thread_load_a_start_k = BLOCK_START_K + threadIdx.x;
+        // if (thread_load_a_start_i == 0) {
+        //     printf("blockIdx %d, %d, thread idx %d, %d : loading a[%d][%d] = %f\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, thread_load_a_start_i, thread_load_a_start_k, a[thread_load_a_start_i * size_k + thread_load_a_start_k]);
+        // }
+        shared_A[THREAD_OFFSET_I * TILE_DIM_K + threadIdx.x] = a[thread_load_a_start_i * size_k + thread_load_a_start_k];
+    //     break;
+
+        int thread_load_b_start_k = BLOCK_START_K + threadIdx.y;
+        int thread_load_b_start_j = BLOCK_START_J + THREAD_OFFSET_J;
+        shared_B[threadIdx.y * TILE_DIM_J + THREAD_OFFSET_J] = b[thread_load_b_start_k * size_j + thread_load_b_start_j];
+
+        int thread_load_c_start_i = BLOCK_START_I + THREAD_OFFSET_I;
+        int thread_load_c_start_j = BLOCK_START_J + THREAD_OFFSET_J;
+        shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J] = c[thread_load_c_start_i * size_j + thread_load_c_start_j];
+
+        __syncthreads();
+
+        // COMPUTE 
+        float sum = shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J];
+        for (int k = 0; k < TILE_DIM_K; k += 1) {
+            float a_val = shared_A[THREAD_OFFSET_I * TILE_DIM_K + k];
+            float b_val = shared_B[k * TILE_DIM_J + THREAD_OFFSET_J];
+            sum += a_val * b_val;            
+
+            int compute_i = BLOCK_START_I + THREAD_OFFSET_I;
+            int compute_j = BLOCK_START_J + THREAD_OFFSET_J;
+            int compute_k = BLOCK_START_K + k;
+            // if (compute_i == 0 && compute_j == 0) {
+            //     printf("blockIdx %d, %d, thread idx %d, %d : k = %d, computing a[%d][%d] * b[%d][%d] = %f; sum = %f\n", 
+            //             blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, k, compute_i, compute_k, compute_k, compute_j, a_val * b_val, sum);
+            // }
+        }
+        shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J] = sum;
+
+        __syncthreads();
+
+        // STORE
+        int thread_store_i = BLOCK_START_I + THREAD_OFFSET_I;
+        int thread_store_j = BLOCK_START_J + THREAD_OFFSET_J;
+        c[thread_store_i * size_j + thread_store_j] = shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J];
+
+        __syncthreads();
+    }
+    
+    // for (int i = THREAD_START_I; i < BLOCK_START_I + BLOCK_DIM_I; i+=THREADS_PER_WARP) {
+    //     for (int j = THREAD_START_J; j < BLOCK_START_J + BLOCK_DIM_J; j+=THREADS_PER_WARP) {
+    //         float sum = 0.0;
+    //         for (int k = 0; k < size_k; k++) {
+    //             sum += a[i * size_k + k] * b[k * size_j + j];
+    //         }
+    //         c[i * size_j + j] = sum;
+    //     }
+    // }
 }
 
 void launch_matmul_l1(
@@ -66,7 +140,42 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+
+    // X = J, Y = I
+    
+    int TILE_DIM_I = 32;
+    int TILE_DIM_J = 32;
+    int TILE_DIM_K = 32;
+    int NUM_TILES_I = (size_i + TILE_DIM_I - 1) / TILE_DIM_I;
+    int NUM_TILES_J = (size_j + TILE_DIM_J - 1) / TILE_DIM_J;
+
+    dim3 num_blocks(NUM_TILES_J, NUM_TILES_I);
+    dim3 block_size(TILE_DIM_J, TILE_DIM_I);
+
+    int shmem_size_bytes = (TILE_DIM_I * TILE_DIM_K + TILE_DIM_K * TILE_DIM_J + TILE_DIM_I * TILE_DIM_J) * sizeof(float);
+
+    // int shmem_size_bytes = (TILE_DIM_I * TILE_DIM_J) * sizeof(float);
+    // int shmem_max_elem = (99 * 1024) / sizeof(float);
+    // int shmem_elem_remaining = shmem_max_elem - (TILE_DIM_I * TILE_DIM_J);
+    // int k_groups_remaining = shmem_elem_remaining / (32 * TILE_DIM_I + 32 * TILE_DIM_J); // 32 threads per warp
+    // shmem_size_bytes += k_groups_remaining * 32 * (TILE_DIM_I + TILE_DIM_J) * sizeof(float);
+
+    // std::cout << "shmem_max_elem: " << shmem_max_elem << std::endl;
+    // std::cout << "shmem_elem_remaining: " << shmem_elem_remaining << std::endl;
+    // std::cout << "k_groups_remaining: " << k_groups_remaining << std::endl;
+
+    std::cout << "shmem_size_bytes: " << shmem_size_bytes << std::endl;
+    std::cout << "percent of shmem used: " << (double)shmem_size_bytes / (100 * 1024) * 100 << "%" << std::endl;
+    assert(shmem_size_bytes <= 100 * 1024);
+    CUDA_CHECK(cudaFuncSetAttribute(matmul_l1,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    shmem_size_bytes));
+
+    std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
+    std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
+
+    matmul_l1<<<num_blocks, block_size, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c, TILE_DIM_I, TILE_DIM_J, TILE_DIM_K);
+
 }
 
 }; // namespace matmul_l1
@@ -180,6 +289,7 @@ void run_tests_for_size(
             size_k * size_j * sizeof(float),
             cudaMemcpyHostToDevice));
 
+        std::cout << "RUNNING " << Impl::name << std::endl;
         Impl::run(size_i, size_j, size_k, a_gpu, b_gpu, c_gpu);
 
         std::vector<float> c_out_host(size_i * size_j);
@@ -196,6 +306,10 @@ void run_tests_for_size(
                 float diff = c_out_host[i * size_j + j] - c[i * size_j + j];
                 mse += diff * diff;
                 ref_mean_square += c[i * size_j + j] * c[i * size_j + j];
+
+                // if (diff > 1e-6) {
+                //     std::cout << "HIGH DIFF: ref[" << i << "][" << j << "] = " << c[i * size_j + j] << ", out[" << i << "][" << j << "] = " << c_out_host[i * size_j + j] << ", diff = " << diff << std::endl;
+                // }
             }
         }
         mse /= size_i * size_j;
@@ -232,8 +346,9 @@ void run_all_tests(
     std::string const &test_data_dir,
     std::vector<BenchmarkResult> &saved_results) {
     printf("%s:\n\n", Impl::name);
+    // run_tests_for_size<Impl>(test_data_dir, saved_results, {{32, 32, 32, false}});
     run_tests_for_size<Impl>(test_data_dir, saved_results, {{256, 256, 256, false}});
-    run_tests_for_size<Impl>(test_data_dir, saved_results, {{3072, 3072, 3072, true}});
+    // run_tests_for_size<Impl>(test_data_dir, saved_results, {{3072, 3072, 3072, true}});
 }
 
 struct MatmulL1 {
@@ -268,7 +383,7 @@ int main(int argc, char **argv) {
     auto saved_results = std::vector<BenchmarkResult>();
 
     run_all_tests<MatmulL1>(test_data_dir, saved_results);
-    run_all_tests<MatmulL1Reg>(test_data_dir, saved_results);
+    // run_all_tests<MatmulL1Reg>(test_data_dir, saved_results);
 
     if (saved_results.size() > 1) {
         printf("speedups on largest problem size:\n");
