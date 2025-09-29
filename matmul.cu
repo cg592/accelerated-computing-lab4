@@ -164,15 +164,15 @@ void launch_matmul_l1(
     // std::cout << "shmem_elem_remaining: " << shmem_elem_remaining << std::endl;
     // std::cout << "k_groups_remaining: " << k_groups_remaining << std::endl;
 
-    std::cout << "shmem_size_bytes: " << shmem_size_bytes << std::endl;
-    std::cout << "percent of shmem used: " << (double)shmem_size_bytes / (100 * 1024) * 100 << "%" << std::endl;
+    // std::cout << "shmem_size_bytes: " << shmem_size_bytes << std::endl;
+    // std::cout << "percent of shmem used: " << (double)shmem_size_bytes / (100 * 1024) * 100 << "%" << std::endl;
     assert(shmem_size_bytes <= 100 * 1024);
     CUDA_CHECK(cudaFuncSetAttribute(matmul_l1,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     shmem_size_bytes));
 
-    std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
-    std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
+    // std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
+    // std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
 
     matmul_l1<<<num_blocks, block_size, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c, TILE_DIM_I, TILE_DIM_J, TILE_DIM_K);
 
@@ -289,7 +289,6 @@ void run_tests_for_size(
             size_k * size_j * sizeof(float),
             cudaMemcpyHostToDevice));
 
-        std::cout << "RUNNING " << Impl::name << std::endl;
         Impl::run(size_i, size_j, size_k, a_gpu, b_gpu, c_gpu);
 
         std::vector<float> c_out_host(size_i * size_j);
@@ -306,10 +305,6 @@ void run_tests_for_size(
                 float diff = c_out_host[i * size_j + j] - c[i * size_j + j];
                 mse += diff * diff;
                 ref_mean_square += c[i * size_j + j] * c[i * size_j + j];
-
-                // if (diff > 1e-6) {
-                //     std::cout << "HIGH DIFF: ref[" << i << "][" << j << "] = " << c[i * size_j + j] << ", out[" << i << "][" << j << "] = " << c_out_host[i * size_j + j] << ", diff = " << diff << std::endl;
-                // }
             }
         }
         mse /= size_i * size_j;
@@ -346,9 +341,8 @@ void run_all_tests(
     std::string const &test_data_dir,
     std::vector<BenchmarkResult> &saved_results) {
     printf("%s:\n\n", Impl::name);
-    // run_tests_for_size<Impl>(test_data_dir, saved_results, {{32, 32, 32, false}});
     run_tests_for_size<Impl>(test_data_dir, saved_results, {{256, 256, 256, false}});
-    // run_tests_for_size<Impl>(test_data_dir, saved_results, {{3072, 3072, 3072, true}});
+    run_tests_for_size<Impl>(test_data_dir, saved_results, {{3072, 3072, 3072, true}});
 }
 
 struct MatmulL1 {
@@ -383,7 +377,7 @@ int main(int argc, char **argv) {
     auto saved_results = std::vector<BenchmarkResult>();
 
     run_all_tests<MatmulL1>(test_data_dir, saved_results);
-    // run_all_tests<MatmulL1Reg>(test_data_dir, saved_results);
+    run_all_tests<MatmulL1Reg>(test_data_dir, saved_results);
 
     if (saved_results.size() > 1) {
         printf("speedups on largest problem size:\n");
