@@ -74,16 +74,14 @@ __global__ void matmul_l1(
     float* shared_B = shared_A + TILE_DIM_I * TILE_DIM_K;
     float* shared_C = shared_B + TILE_DIM_K * TILE_DIM_J;
 
+    float sum = 0.0;
+
     for (int BLOCK_START_K = 0; BLOCK_START_K < size_k; BLOCK_START_K += TILE_DIM_K) {
         // LOAD 
         assert(TILE_DIM_I == THREADS_PER_WARP && TILE_DIM_J == THREADS_PER_WARP && TILE_DIM_K == THREADS_PER_WARP);
         int thread_load_a_start_i = BLOCK_START_I + THREAD_OFFSET_I;
         int thread_load_a_start_k = BLOCK_START_K + threadIdx.x;
-        // if (thread_load_a_start_i == 0) {
-        //     printf("blockIdx %d, %d, thread idx %d, %d : loading a[%d][%d] = %f\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, thread_load_a_start_i, thread_load_a_start_k, a[thread_load_a_start_i * size_k + thread_load_a_start_k]);
-        // }
         shared_A[THREAD_OFFSET_I * TILE_DIM_K + threadIdx.x] = a[thread_load_a_start_i * size_k + thread_load_a_start_k];
-    //     break;
 
         int thread_load_b_start_k = BLOCK_START_K + threadIdx.y;
         int thread_load_b_start_j = BLOCK_START_J + THREAD_OFFSET_J;
@@ -96,7 +94,6 @@ __global__ void matmul_l1(
         __syncthreads();
 
         // COMPUTE 
-        float sum = shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J];
         for (int k = 0; k < TILE_DIM_K; k += 1) {
             float a_val = shared_A[THREAD_OFFSET_I * TILE_DIM_K + k];
             float b_val = shared_B[k * TILE_DIM_J + THREAD_OFFSET_J];
@@ -105,32 +102,13 @@ __global__ void matmul_l1(
             int compute_i = BLOCK_START_I + THREAD_OFFSET_I;
             int compute_j = BLOCK_START_J + THREAD_OFFSET_J;
             int compute_k = BLOCK_START_K + k;
-            // if (compute_i == 0 && compute_j == 0) {
-            //     printf("blockIdx %d, %d, thread idx %d, %d : k = %d, computing a[%d][%d] * b[%d][%d] = %f; sum = %f\n", 
-            //             blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, k, compute_i, compute_k, compute_k, compute_j, a_val * b_val, sum);
-            // }
         }
-        shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J] = sum;
-
-        __syncthreads();
-
-        // STORE
-        int thread_store_i = BLOCK_START_I + THREAD_OFFSET_I;
-        int thread_store_j = BLOCK_START_J + THREAD_OFFSET_J;
-        c[thread_store_i * size_j + thread_store_j] = shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J];
-
         __syncthreads();
     }
-    
-    // for (int i = THREAD_START_I; i < BLOCK_START_I + BLOCK_DIM_I; i+=THREADS_PER_WARP) {
-    //     for (int j = THREAD_START_J; j < BLOCK_START_J + BLOCK_DIM_J; j+=THREADS_PER_WARP) {
-    //         float sum = 0.0;
-    //         for (int k = 0; k < size_k; k++) {
-    //             sum += a[i * size_k + k] * b[k * size_j + j];
-    //         }
-    //         c[i * size_j + j] = sum;
-    //     }
-    // }
+
+    int thread_store_i = BLOCK_START_I + THREAD_OFFSET_I;
+    int thread_store_j = BLOCK_START_J + THREAD_OFFSET_J;
+    c[thread_store_i * size_j + thread_store_j] = sum;
 }
 
 void launch_matmul_l1(
