@@ -50,58 +50,61 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 namespace matmul_l1 {
 
+#define TILE_DIM_I_ 32
+#define TILE_DIM_J_ 32
+#define TILE_DIM_K_ 32
+
 __global__ void matmul_l1(
     int32_t size_i,
     int32_t size_j,
     int32_t size_k,
     float const *a,
     float const *b,
-    float *c,
-    int TILE_DIM_I,
-    int TILE_DIM_J,
-    int TILE_DIM_K) {
-    
+    float *c) {
+
     int BLOCK_DIM_J = blockDim.x;
     int BLOCK_DIM_I = blockDim.y;
     int BLOCK_START_J = blockIdx.x * BLOCK_DIM_J;
     int BLOCK_START_I = blockIdx.y * BLOCK_DIM_I;
-    int THREADS_PER_WARP = 32;
     int THREAD_OFFSET_J = threadIdx.x;
     int THREAD_OFFSET_I = threadIdx.y;
 
     extern __shared__ float shmem[];
     float* shared_A = shmem;
-    float* shared_B = shared_A + TILE_DIM_I * TILE_DIM_K;
-    float* shared_C = shared_B + TILE_DIM_K * TILE_DIM_J;
+    float* shared_B = shared_A + TILE_DIM_I_ * TILE_DIM_K_;
 
     float sum = 0.0;
 
-    for (int BLOCK_START_K = 0; BLOCK_START_K < size_k; BLOCK_START_K += TILE_DIM_K) {
+    for (int BLOCK_START_K = 0; BLOCK_START_K < size_k; BLOCK_START_K += TILE_DIM_K_) {
         // LOAD 
-        assert(TILE_DIM_I == THREADS_PER_WARP && TILE_DIM_J == THREADS_PER_WARP && TILE_DIM_K == THREADS_PER_WARP);
+        int thread_offset_k_A = threadIdx.x;
         int thread_load_a_start_i = BLOCK_START_I + THREAD_OFFSET_I;
-        int thread_load_a_start_k = BLOCK_START_K + threadIdx.x;
-        shared_A[THREAD_OFFSET_I * TILE_DIM_K + threadIdx.x] = a[thread_load_a_start_i * size_k + thread_load_a_start_k];
+        int thread_load_a_start_k = BLOCK_START_K + thread_offset_k_A;
+        
+        // Bounds check for matrix A loading
+        if (thread_offset_k_A < TILE_DIM_K_ && thread_load_a_start_i < size_i && thread_load_a_start_k < size_k) {
+            shared_A[THREAD_OFFSET_I * TILE_DIM_K_ + thread_offset_k_A] = a[thread_load_a_start_i * size_k + thread_load_a_start_k];
+        }
 
-        int thread_load_b_start_k = BLOCK_START_K + threadIdx.y;
+        int thread_offset_k_B = threadIdx.y;
+        int thread_load_b_start_k = BLOCK_START_K + thread_offset_k_B;
         int thread_load_b_start_j = BLOCK_START_J + THREAD_OFFSET_J;
-        shared_B[threadIdx.y * TILE_DIM_J + THREAD_OFFSET_J] = b[thread_load_b_start_k * size_j + thread_load_b_start_j];
-
-        int thread_load_c_start_i = BLOCK_START_I + THREAD_OFFSET_I;
-        int thread_load_c_start_j = BLOCK_START_J + THREAD_OFFSET_J;
-        shared_C[THREAD_OFFSET_I * TILE_DIM_J + THREAD_OFFSET_J] = c[thread_load_c_start_i * size_j + thread_load_c_start_j];
+        
+        // Bounds check for matrix B loading
+        if (thread_offset_k_B < TILE_DIM_K_ && thread_load_b_start_k < size_k && thread_load_b_start_j < size_j) {
+            shared_B[thread_offset_k_B * TILE_DIM_J_ + THREAD_OFFSET_J] = b[thread_load_b_start_k * size_j + thread_load_b_start_j];
+        }
 
         __syncthreads();
 
         // COMPUTE 
-        for (int k = 0; k < TILE_DIM_K; k += 1) {
-            float a_val = shared_A[THREAD_OFFSET_I * TILE_DIM_K + k];
-            float b_val = shared_B[k * TILE_DIM_J + THREAD_OFFSET_J];
+        // NOTE: big benefit came from unrolling here (41ms -> 27ms, aka. 1.5x speedup)
+        // which is only possible when TILE_DIM_* variables are compile-time constants 
+        // #pragma unroll
+        for (int k = 0; k < TILE_DIM_K_; k += 1) {
+            float a_val = shared_A[THREAD_OFFSET_I * TILE_DIM_K_ + k];
+            float b_val = shared_B[k * TILE_DIM_J_ + THREAD_OFFSET_J];
             sum += a_val * b_val;            
-
-            int compute_i = BLOCK_START_I + THREAD_OFFSET_I;
-            int compute_j = BLOCK_START_J + THREAD_OFFSET_J;
-            int compute_k = BLOCK_START_K + k;
         }
         __syncthreads();
     }
@@ -121,16 +124,13 @@ void launch_matmul_l1(
 
     // X = J, Y = I
     
-    int TILE_DIM_I = 32;
-    int TILE_DIM_J = 32;
-    int TILE_DIM_K = 32;
-    int NUM_TILES_I = (size_i + TILE_DIM_I - 1) / TILE_DIM_I;
-    int NUM_TILES_J = (size_j + TILE_DIM_J - 1) / TILE_DIM_J;
+    int NUM_TILES_I = (size_i + TILE_DIM_I_ - 1) / TILE_DIM_I_;
+    int NUM_TILES_J = (size_j + TILE_DIM_J_ - 1) / TILE_DIM_J_;
 
     dim3 num_blocks(NUM_TILES_J, NUM_TILES_I);
-    dim3 block_size(TILE_DIM_J, TILE_DIM_I);
+    dim3 block_size(TILE_DIM_J_, TILE_DIM_I_);
 
-    int shmem_size_bytes = (TILE_DIM_I * TILE_DIM_K + TILE_DIM_K * TILE_DIM_J + TILE_DIM_I * TILE_DIM_J) * sizeof(float);
+    int shmem_size_bytes = (TILE_DIM_I_ * TILE_DIM_K_ + TILE_DIM_K_ * TILE_DIM_J_) * sizeof(float);
 
     // int shmem_size_bytes = (TILE_DIM_I * TILE_DIM_J) * sizeof(float);
     // int shmem_max_elem = (99 * 1024) / sizeof(float);
@@ -152,7 +152,7 @@ void launch_matmul_l1(
     // std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
     // std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
 
-    matmul_l1<<<num_blocks, block_size, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c, TILE_DIM_I, TILE_DIM_J, TILE_DIM_K);
+    matmul_l1<<<num_blocks, block_size, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
 
 }
 
@@ -163,6 +163,11 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+#define MICROTILE_DIM 2
+#define FULL_TILE_DIM (32 * MICROTILE_DIM)
+// #define FULL_TILE_DIM_PLUS_ONE (FULL_TILE_DIM + 1)
+#define FULL_TILE_DIM_PLUS_ONE (FULL_TILE_DIM)
+
 __global__ void matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
@@ -170,7 +175,78 @@ __global__ void matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your GPU code here */
+
+    int TILE_START_J = blockIdx.x * FULL_TILE_DIM;
+    int TILE_START_I = blockIdx.y * FULL_TILE_DIM;
+    int THREADS_PER_WARP = 32;
+    int THREAD_OFFSET_J = threadIdx.x;
+    int THREAD_OFFSET_I = threadIdx.y;
+
+    extern __shared__ float shmem[];
+    float* shared_A = shmem;
+    float* shared_B = shared_A + FULL_TILE_DIM_PLUS_ONE * FULL_TILE_DIM_PLUS_ONE;
+
+    float sum[MICROTILE_DIM][MICROTILE_DIM];
+    for (int i = 0; i < MICROTILE_DIM; i++) {
+        for (int j = 0; j < MICROTILE_DIM; j++) {
+            sum[i][j] = 0.0;
+        }
+    }
+
+    for (int BLOCK_START_K = 0; BLOCK_START_K < size_k; BLOCK_START_K += FULL_TILE_DIM) {
+        // LOAD A
+        int THREAD_OFFSET_K_A = threadIdx.x;
+        for (int thread_load_i = TILE_START_I + THREAD_OFFSET_I; thread_load_i < TILE_START_I + FULL_TILE_DIM; thread_load_i += THREADS_PER_WARP) {
+            for (int thread_load_k = BLOCK_START_K + THREAD_OFFSET_K_A; thread_load_k < BLOCK_START_K + FULL_TILE_DIM; thread_load_k += THREADS_PER_WARP) {
+                int thread_offset_i = thread_load_i - TILE_START_I;
+                int thread_offset_k = thread_load_k - BLOCK_START_K;
+                shared_A[thread_offset_i * FULL_TILE_DIM_PLUS_ONE + thread_offset_k] = a[thread_load_i * size_k + thread_load_k];
+            }
+        }
+
+        // LOAD B
+        int THREAD_OFFSET_K_B = threadIdx.y;
+        for (int thread_load_k = BLOCK_START_K + THREAD_OFFSET_K_B; thread_load_k < BLOCK_START_K + FULL_TILE_DIM; thread_load_k += THREADS_PER_WARP) {
+            for (int thread_load_j = TILE_START_J + THREAD_OFFSET_J; thread_load_j < TILE_START_J + FULL_TILE_DIM; thread_load_j += THREADS_PER_WARP) {
+                int thread_offset_k = thread_load_k - BLOCK_START_K;
+                int thread_offset_j = thread_load_j - TILE_START_J;
+                shared_B[thread_offset_k * FULL_TILE_DIM_PLUS_ONE + thread_offset_j] = b[thread_load_k * size_j + thread_load_j];
+            }
+        }
+
+        __syncthreads();
+
+        // COMPUTE a microtile
+        for (int k = 0; k < FULL_TILE_DIM; k += 1) {
+            // load a micro-column of shared_A and a micro-row of shared_B into registers
+            float a_micro_col[MICROTILE_DIM];
+            float b_micro_row[MICROTILE_DIM];
+            for (int m = 0; m < MICROTILE_DIM; m++) {
+                a_micro_col[m] = shared_A[((THREAD_OFFSET_I * MICROTILE_DIM) + m) * FULL_TILE_DIM_PLUS_ONE + k];
+                b_micro_row[m] = shared_B[k * FULL_TILE_DIM_PLUS_ONE + ((THREAD_OFFSET_J * MICROTILE_DIM) + m)];
+            }
+            
+            // compute the microtile
+            for (int mi = 0; mi < MICROTILE_DIM; mi++) {
+                for (int mj = 0; mj < MICROTILE_DIM; mj++) {
+                    sum[mi][mj] += a_micro_col[mi] * b_micro_row[mj];
+                }
+            }
+
+        }
+
+        __syncthreads();
+    }
+
+    // STORE back the entire microtile
+    for (int mi = 0; mi < MICROTILE_DIM; mi++) {
+        for (int mj = 0; mj < MICROTILE_DIM; mj++) {
+            int store_i = TILE_START_I + (THREAD_OFFSET_I * MICROTILE_DIM) + mi;
+            int store_j = TILE_START_J + (THREAD_OFFSET_J * MICROTILE_DIM) + mj;
+            c[store_i * size_j + store_j] = sum[mi][mj];
+        }
+    }
+
 }
 
 void launch_matmul_l1_reg(
@@ -180,7 +256,32 @@ void launch_matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+
+    int BLOCK_DIM_X = 32; // threads! not matrix
+    int BLOCK_DIM_Y = 32; // threads! not matrix
+
+    int NUM_TILES_I = (size_i + FULL_TILE_DIM - 1) / FULL_TILE_DIM;
+    int NUM_TILES_J = (size_j + FULL_TILE_DIM - 1) / FULL_TILE_DIM;
+
+    dim3 num_blocks(NUM_TILES_J, NUM_TILES_I);
+    dim3 block_size(BLOCK_DIM_X, BLOCK_DIM_Y);
+
+    int shmem_size_bytes = (2 * FULL_TILE_DIM_PLUS_ONE * FULL_TILE_DIM_PLUS_ONE) * sizeof(float);
+
+    assert(shmem_size_bytes <= 100 * 1024);
+    CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    shmem_size_bytes));
+
+    // std::cout << "size_i: " << size_i << std::endl;
+    // std::cout << "size_j: " << size_j << std::endl;
+    // std::cout << "size_k: " << size_k << std::endl;
+    // std::cout << "FULL_TILE_DIM: " << FULL_TILE_DIM << std::endl;
+    // std::cout << "MICROTILE_DIM: " << MICROTILE_DIM << std::endl;
+    // std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
+    // std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
+
+    matmul_l1_reg<<<num_blocks, block_size, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1_reg
@@ -283,6 +384,11 @@ void run_tests_for_size(
                 float diff = c_out_host[i * size_j + j] - c[i * size_j + j];
                 mse += diff * diff;
                 ref_mean_square += c[i * size_j + j] * c[i * size_j + j];
+
+                // if (std::abs(diff) > 1e-6) {
+                //     std::cout << "diff[" << i << "][" << j << "] = " << diff << " :: c_out_host[" << i << "][" << j << "] = " << c_out_host[i * size_j + j] << " :: c[" << i << "][" << j << "] = " << c[i * size_j + j] << std::endl;
+                //     assert(false);
+                // }
             }
         }
         mse /= size_i * size_j;
