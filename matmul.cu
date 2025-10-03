@@ -163,10 +163,9 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
-#define MICROTILE_DIM 3
+#define MICROTILE_DIM 5
 #define FULL_TILE_DIM (32 * MICROTILE_DIM)
-// #define FULL_TILE_DIM_PLUS_ONE (FULL_TILE_DIM + 1)
-#define FULL_TILE_DIM_PLUS_ONE (FULL_TILE_DIM)
+#define TILE_DIM_K 32
 
 __global__ void matmul_l1_reg(
     int32_t size_i,
@@ -184,7 +183,9 @@ __global__ void matmul_l1_reg(
 
     extern __shared__ float shmem[];
     float* shared_A = shmem;
-    float* shared_B = shared_A + FULL_TILE_DIM_PLUS_ONE * FULL_TILE_DIM_PLUS_ONE;
+    // int shared_A_size_ceil = (FULL_TILE_DIM * TILE_DIM_K + 31) / 32 * 32;
+    // float* shared_B = shared_A + shared_A_size_ceil;
+    float* shared_B = shared_A + TILE_DIM_K * FULL_TILE_DIM;
 
     float sum[MICROTILE_DIM][MICROTILE_DIM];
     for (int i = 0; i < MICROTILE_DIM; i++) {
@@ -193,43 +194,41 @@ __global__ void matmul_l1_reg(
         }
     }
 
-    for (int BLOCK_START_K = 0; BLOCK_START_K < size_k; BLOCK_START_K += FULL_TILE_DIM) {
+    for (int BLOCK_START_K = 0; BLOCK_START_K < size_k; BLOCK_START_K += TILE_DIM_K) {
         // LOAD A
         int THREAD_OFFSET_K_A = threadIdx.x;
-        for (int thread_load_i = TILE_START_I + THREAD_OFFSET_I; thread_load_i < TILE_START_I + FULL_TILE_DIM; thread_load_i += THREADS_PER_WARP) {
-            for (int thread_load_k = BLOCK_START_K + THREAD_OFFSET_K_A; thread_load_k < BLOCK_START_K + FULL_TILE_DIM; thread_load_k += THREADS_PER_WARP) {
+        for (int thread_load_i = TILE_START_I + THREAD_OFFSET_I; thread_load_i < TILE_START_I + FULL_TILE_DIM && thread_load_i < size_i; thread_load_i += THREADS_PER_WARP) {
+            for (int thread_load_k = BLOCK_START_K + THREAD_OFFSET_K_A; thread_load_k < BLOCK_START_K + TILE_DIM_K && thread_load_k < size_k; thread_load_k += THREADS_PER_WARP) {
                 int thread_offset_i = thread_load_i - TILE_START_I;
                 int thread_offset_k = thread_load_k - BLOCK_START_K;
-                // transpose A to eliminate bank conflicts when accessing shared_A
-                shared_A[thread_offset_i * FULL_TILE_DIM_PLUS_ONE + thread_offset_k] = a[thread_load_i * size_k + thread_load_k];
-
-                // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 1) {
-                //     printf("accessing a[%d][%d] and placing into %p\n", thread_load_i, thread_load_k, &shared_A[thread_offset_i * FULL_TILE_DIM_PLUS_ONE + thread_offset_k]);
-                // }
+                assert(thread_offset_i < FULL_TILE_DIM);
+                assert(thread_offset_k < TILE_DIM_K);
+                shared_A[thread_offset_i * TILE_DIM_K + thread_offset_k] = a[thread_load_i * size_k + thread_load_k];
             }
         }
 
         // LOAD B
         int THREAD_OFFSET_K_B = threadIdx.y;
-        for (int thread_load_k = BLOCK_START_K + THREAD_OFFSET_K_B; thread_load_k < BLOCK_START_K + FULL_TILE_DIM; thread_load_k += THREADS_PER_WARP) {
-            for (int thread_load_j = TILE_START_J + THREAD_OFFSET_J; thread_load_j < TILE_START_J + FULL_TILE_DIM; thread_load_j += THREADS_PER_WARP) {
+        for (int thread_load_k = BLOCK_START_K + THREAD_OFFSET_K_B; thread_load_k < BLOCK_START_K + TILE_DIM_K && thread_load_k < size_k; thread_load_k += THREADS_PER_WARP) {
+            for (int thread_load_j = TILE_START_J + THREAD_OFFSET_J; thread_load_j < TILE_START_J + FULL_TILE_DIM && thread_load_j < size_j; thread_load_j += THREADS_PER_WARP) {
                 int thread_offset_k = thread_load_k - BLOCK_START_K;
                 int thread_offset_j = thread_load_j - TILE_START_J;
-                shared_B[thread_offset_k * FULL_TILE_DIM_PLUS_ONE + thread_offset_j] = b[thread_load_k * size_j + thread_load_j];
+                assert(thread_offset_k < TILE_DIM_K);
+                assert(thread_offset_j < FULL_TILE_DIM);
+                shared_B[thread_offset_k * FULL_TILE_DIM + thread_offset_j] = b[thread_load_k * size_j + thread_load_j];
             }
         }
 
         __syncthreads();
 
         // COMPUTE a microtile
-        for (int k = 0; k < FULL_TILE_DIM; k += 1) {
+        for (int k = 0; k < TILE_DIM_K; k += 1) {
             // load a micro-column of shared_A and a micro-row of shared_B into registers
             float a_micro_col[MICROTILE_DIM];
             float b_micro_row[MICROTILE_DIM];
             for (int m = 0; m < MICROTILE_DIM; m++) {
-                // a_micro_col[m] = shared_A[k * FULL_TILE_DIM_PLUS_ONE + ((THREAD_OFFSET_I * MICROTILE_DIM) + m)];
-                a_micro_col[m] = shared_A[((THREAD_OFFSET_I * MICROTILE_DIM) + m) * FULL_TILE_DIM_PLUS_ONE + k];
-                b_micro_row[m] = shared_B[k * FULL_TILE_DIM_PLUS_ONE + ((THREAD_OFFSET_J * MICROTILE_DIM) + m)];
+                a_micro_col[m] = shared_A[((THREAD_OFFSET_I * MICROTILE_DIM) + m) * TILE_DIM_K + k];
+                b_micro_row[m] = shared_B[k * FULL_TILE_DIM + ((THREAD_OFFSET_J * MICROTILE_DIM) + m)];
             }
             
             // compute the microtile
@@ -249,7 +248,9 @@ __global__ void matmul_l1_reg(
         for (int mj = 0; mj < MICROTILE_DIM; mj++) {
             int store_i = TILE_START_I + (THREAD_OFFSET_I * MICROTILE_DIM) + mi;
             int store_j = TILE_START_J + (THREAD_OFFSET_J * MICROTILE_DIM) + mj;
-            c[store_i * size_j + store_j] = sum[mi][mj];
+            if (store_i < size_i && store_j < size_j) {
+                c[store_i * size_j + store_j] = sum[mi][mj];
+            }
         }
     }
 
@@ -272,7 +273,9 @@ void launch_matmul_l1_reg(
     dim3 num_blocks(NUM_TILES_J, NUM_TILES_I);
     dim3 block_size(BLOCK_DIM_X, BLOCK_DIM_Y);
 
-    int shmem_size_bytes = (2 * FULL_TILE_DIM_PLUS_ONE * FULL_TILE_DIM_PLUS_ONE) * sizeof(float);
+    // int shared_A_size_ceil = (TILE_DIM_K * FULL_TILE_DIM + 31) / 32 * 32;
+    // int shmem_size_bytes = (2 * shared_A_size_ceil) * sizeof(float);
+    int shmem_size_bytes = (2 * FULL_TILE_DIM * TILE_DIM_K) * sizeof(float);
 
     assert(shmem_size_bytes <= 100 * 1024);
     CUDA_CHECK(cudaFuncSetAttribute(matmul_l1_reg,
