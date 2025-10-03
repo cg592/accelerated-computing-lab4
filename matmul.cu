@@ -163,7 +163,7 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
-#define MICROTILE_DIM 5
+#define MICROTILE_DIM 11
 #define FULL_TILE_DIM (32 * MICROTILE_DIM)
 #define TILE_DIM_K 32
 
@@ -175,11 +175,26 @@ __global__ void matmul_l1_reg(
     float const *b,
     float *c) {
 
+    printf("starting my kernel\n");
+
     int TILE_START_J = blockIdx.x * FULL_TILE_DIM;
     int TILE_START_I = blockIdx.y * FULL_TILE_DIM;
     int THREADS_PER_WARP = 32;
     int THREAD_OFFSET_J = threadIdx.x;
     int THREAD_OFFSET_I = threadIdx.y;
+
+    int MICROTILE_ROOM_I = size_i - (TILE_START_I + THREAD_OFFSET_I * MICROTILE_DIM);
+    MICROTILE_ROOM_I = std::max(MICROTILE_ROOM_I, 0);
+    int MAX_MICROTILE_DIM_I = std::min(MICROTILE_ROOM_I, MICROTILE_DIM);
+    int MICROTILE_ROOM_J = size_j - (TILE_START_J + THREAD_OFFSET_J * MICROTILE_DIM);
+    MICROTILE_ROOM_J = std::max(MICROTILE_ROOM_J, 0);
+    int MAX_MICROTILE_DIM_J = std::min(MICROTILE_ROOM_J, MICROTILE_DIM);
+
+    printf("hello world\n");
+
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("MICROTILE_ROOM_I: %d, MAX_MICROTILE_DIM_I: %d, MICROTILE_ROOM_J: %d, MAX_MICROTILE_DIM_J: %d\n", MICROTILE_ROOM_I, MAX_MICROTILE_DIM_I, MICROTILE_ROOM_J, MAX_MICROTILE_DIM_J);
+    }
 
     extern __shared__ float shmem[];
     float* shared_A = shmem;
@@ -226,14 +241,17 @@ __global__ void matmul_l1_reg(
             // load a micro-column of shared_A and a micro-row of shared_B into registers
             float a_micro_col[MICROTILE_DIM];
             float b_micro_row[MICROTILE_DIM];
-            for (int m = 0; m < MICROTILE_DIM; m++) {
+            for (int m = 0; m < MAX_MICROTILE_DIM_I; m++) {
                 a_micro_col[m] = shared_A[((THREAD_OFFSET_I * MICROTILE_DIM) + m) * TILE_DIM_K + k];
+                // b_micro_row[m] = shared_B[k * FULL_TILE_DIM + ((THREAD_OFFSET_J * MICROTILE_DIM) + m)];
+            }
+            for (int m = 0; m < MAX_MICROTILE_DIM_J; m++) {
                 b_micro_row[m] = shared_B[k * FULL_TILE_DIM + ((THREAD_OFFSET_J * MICROTILE_DIM) + m)];
             }
             
             // compute the microtile
-            for (int mi = 0; mi < MICROTILE_DIM; mi++) {
-                for (int mj = 0; mj < MICROTILE_DIM; mj++) {
+            for (int mi = 0; mi < MAX_MICROTILE_DIM_I; mi++) {
+                for (int mj = 0; mj < MAX_MICROTILE_DIM_J; mj++) {
                     sum[mi][mj] += a_micro_col[mi] * b_micro_row[mj];
                 }
             }
@@ -244,12 +262,26 @@ __global__ void matmul_l1_reg(
     }
 
     // STORE back the entire microtile
-    for (int mi = 0; mi < MICROTILE_DIM; mi++) {
-        for (int mj = 0; mj < MICROTILE_DIM; mj++) {
+    for (int mi = 0; mi < MAX_MICROTILE_DIM_I; mi++) {
+        for (int mj = 0; mj < MAX_MICROTILE_DIM_J; mj++) {
             int store_i = TILE_START_I + (THREAD_OFFSET_I * MICROTILE_DIM) + mi;
             int store_j = TILE_START_J + (THREAD_OFFSET_J * MICROTILE_DIM) + mj;
+            // if (store_i >= size_i) {
+            //     printf("blockIdx.x: %d, blockIdx.y: %d, threadIdx.x: %d, threadIdx.y: %d, store_i: %d, store_j: %d\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, store_i, store_j);
+            //     assert(false);
+            // }
+            // if (store_j >= size_j) {
+            //     printf("blockIdx.x: %d, blockIdx.y: %d, threadIdx.x: %d, threadIdx.y: %d ;;; TILE_START_J: %d, THREAD_OFFSET_J: %d, MICROTILE_DIM: %d, Mj: %d, store_i: %d, store_j: %d\n", 
+            //         blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, TILE_START_J, THREAD_OFFSET_J, MICROTILE_DIM, mj, store_i, store_j);
+            //     assert(false);
+            // }
+            assert(store_i < size_i);
+            assert(store_j < size_j);
             if (store_i < size_i && store_j < size_j) {
                 c[store_i * size_j + store_j] = sum[mi][mj];
+            }
+            if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+                printf("store_i: %d, store_j: %d, sum[mi][mj]: %f\n", store_i, store_j, sum[mi][mj]);
             }
         }
     }
@@ -282,15 +314,20 @@ void launch_matmul_l1_reg(
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     shmem_size_bytes));
 
-    // std::cout << "size_i: " << size_i << std::endl;
-    // std::cout << "size_j: " << size_j << std::endl;
-    // std::cout << "size_k: " << size_k << std::endl;
-    // std::cout << "FULL_TILE_DIM: " << FULL_TILE_DIM << std::endl;
-    // std::cout << "MICROTILE_DIM: " << MICROTILE_DIM << std::endl;
-    // std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
-    // std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
+    std::cout << "size_i: " << size_i << std::endl;
+    std::cout << "size_j: " << size_j << std::endl;
+    std::cout << "size_k: " << size_k << std::endl;
+    std::cout << "FULL_TILE_DIM: " << FULL_TILE_DIM << std::endl;
+    std::cout << "MICROTILE_DIM: " << MICROTILE_DIM << std::endl;
+    std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
+    std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
+    std::cout << "shmem_size_bytes: " << shmem_size_bytes << std::endl;
 
+    std::cout << "About to launch kernel..." << std::endl;
     matmul_l1_reg<<<num_blocks, block_size, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
+    std::cout << "Kernel launched, checking for errors..." << std::endl;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::cout << "Kernel completed successfully!" << std::endl;
 }
 
 }; // namespace matmul_l1_reg
@@ -394,7 +431,7 @@ void run_tests_for_size(
                 mse += diff * diff;
                 ref_mean_square += c[i * size_j + j] * c[i * size_j + j];
 
-                // if (std::abs(diff) > 1e-6) {
+                // if (std::abs(diff) > 1e-4) {
                 //     std::cout << "diff[" << i << "][" << j << "] = " << diff << " :: c_out_host[" << i << "][" << j << "] = " << c_out_host[i * size_j + j] << " :: c[" << i << "][" << j << "] = " << c[i * size_j + j] << std::endl;
                 //     assert(false);
                 // }
