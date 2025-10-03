@@ -98,9 +98,6 @@ __global__ void matmul_l1(
         __syncthreads();
 
         // COMPUTE 
-        // NOTE: big benefit came from unrolling here (41ms -> 27ms, aka. 1.5x speedup)
-        // which is only possible when TILE_DIM_* variables are compile-time constants 
-        // #pragma unroll
         for (int k = 0; k < TILE_DIM_K_; k += 1) {
             float a_val = shared_A[THREAD_OFFSET_I * TILE_DIM_K_ + k];
             float b_val = shared_B[k * TILE_DIM_J_ + THREAD_OFFSET_J];
@@ -282,6 +279,7 @@ void launch_matmul_l1_reg(
     // std::cout << "MICROTILE_DIM: " << MICROTILE_DIM << std::endl;
     // std::cout << "num_blocks: " << num_blocks.x << " " << num_blocks.y << std::endl;
     // std::cout << "block_size: " << block_size.x << " " << block_size.y << std::endl;
+    // std::cout << "shmem_size_bytes: " << shmem_size_bytes << std::endl;
 
     matmul_l1_reg<<<num_blocks, block_size, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
 }
