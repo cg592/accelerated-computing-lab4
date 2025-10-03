@@ -163,7 +163,7 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
-#define MICROTILE_DIM 2
+#define MICROTILE_DIM 3
 #define FULL_TILE_DIM (32 * MICROTILE_DIM)
 // #define FULL_TILE_DIM_PLUS_ONE (FULL_TILE_DIM + 1)
 #define FULL_TILE_DIM_PLUS_ONE (FULL_TILE_DIM)
@@ -200,7 +200,12 @@ __global__ void matmul_l1_reg(
             for (int thread_load_k = BLOCK_START_K + THREAD_OFFSET_K_A; thread_load_k < BLOCK_START_K + FULL_TILE_DIM; thread_load_k += THREADS_PER_WARP) {
                 int thread_offset_i = thread_load_i - TILE_START_I;
                 int thread_offset_k = thread_load_k - BLOCK_START_K;
+                // transpose A to eliminate bank conflicts when accessing shared_A
                 shared_A[thread_offset_i * FULL_TILE_DIM_PLUS_ONE + thread_offset_k] = a[thread_load_i * size_k + thread_load_k];
+
+                // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.y == 1) {
+                //     printf("accessing a[%d][%d] and placing into %p\n", thread_load_i, thread_load_k, &shared_A[thread_offset_i * FULL_TILE_DIM_PLUS_ONE + thread_offset_k]);
+                // }
             }
         }
 
@@ -222,6 +227,7 @@ __global__ void matmul_l1_reg(
             float a_micro_col[MICROTILE_DIM];
             float b_micro_row[MICROTILE_DIM];
             for (int m = 0; m < MICROTILE_DIM; m++) {
+                // a_micro_col[m] = shared_A[k * FULL_TILE_DIM_PLUS_ONE + ((THREAD_OFFSET_I * MICROTILE_DIM) + m)];
                 a_micro_col[m] = shared_A[((THREAD_OFFSET_I * MICROTILE_DIM) + m) * FULL_TILE_DIM_PLUS_ONE + k];
                 b_micro_row[m] = shared_B[k * FULL_TILE_DIM_PLUS_ONE + ((THREAD_OFFSET_J * MICROTILE_DIM) + m)];
             }
